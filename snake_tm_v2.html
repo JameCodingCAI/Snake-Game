@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Snake + Teachable Machine (v22)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- TFJS + TM Image -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+  <style>
+    :root { --bg:#0b0b0b; --fg:#e8fff4; --accent:#4ade80; --muted:#9ca3af; }
+    * { box-sizing: border-box; }
+    body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,Segoe UI,Roboto,Arial}
+    header{display:flex;align-items:center;gap:.75rem;padding:14px 18px;border-bottom:1px solid #1f2937}
+    header h1{margin:0;font-size:20px;font-weight:700}
+    .pill{display:inline-flex;align-items:center;gap:.4rem;border:1px solid #374151;color:#d1fae5;border-radius:999px;padding:4px 10px}
+    .wrap{max-width:1100px;margin:14px auto;padding:0 16px;display:grid;grid-template-columns:300px 1fr;gap:18px}
+    .card{border:1px solid #1f2937;border-radius:14px;background:#0f1115}
+    .card h3{margin:.75rem 1rem;color:#d1fae5;font-size:15px;font-weight:600}
+    #webcamWrap{padding:10px;display:flex;flex-direction:column;gap:8px}
+    #webcam{display:block;width:100%;border-radius:10px;border:1px solid #1f2937;background:#111}
+    .kv{font:13px/1.3 ui-monospace,Consolas,monospace;color:#cbd5e1}
+    #stageWrap{padding:12px}
+    #hud{display:flex;gap:10px;align-items:center;margin:0 0 8px 0}
+    select,button{background:#0b1220;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:6px 10px}
+    input[type=text]{background:#0b1220;color:#e5e7eb;border:1px solid #334155;border-radius:6px;padding:6px 8px;width:100%;}
+    #canvas{display:block;border:1px solid #26d07c;border-radius:10px;background:#0b0b0b;margin:0 auto}
+    .muted{color:#94a3b8}
+  </style>
+</head>
+<body>
+  <header>
+    <span class="pill">🎮 Snake + Teachable Machine</span>
+    <h1>Gesture-Controlled Snake (v22)</h1>
+    <span class="muted">Press <b>SPACE</b> to start • Click canvas to Pause/Resume</span>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <h3>Camera & Model</h3>
+      <div id="webcamWrap">
+        <canvas id="webcam" width="224" height="224"></canvas>
+        <div class="kv" id="status">⏳ Loading model…</div>
+        <div class="kv" id="label">Label: –</div>
+        <div class="kv" id="conf">Conf: –</div>
+
+        <!-- ช่องกรอกลิงก์โมเดลใหม่ -->
+        <div style="display:flex;gap:6px;flex-direction:column;margin-top:8px;">
+          <input id="modelURL" type="text" placeholder="วางลิงก์โมเดล Teachable Machine เช่น https://teachablemachine.withgoogle.com/models/XXXX/">
+          <button id="loadBtn">🔁 Load Model</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Game</h3>
+      <div id="stageWrap">
+        <div id="hud">
+          <div class="pill" id="gameState">⏸ Idle</div>
+          <label>Speed:
+            <select id="speedSel">
+              <option value="0">Very Slow</option>
+              <option value="1" selected>Slow</option>
+              <option value="2">Normal</option>
+              <option value="3">Fast</option>
+            </select>
+          </label>
+          <div class="muted">Controls: SPACE start • Click canvas Pause/Resume • 1–4 set speed</div>
+        </div>
+        <canvas id="canvas" width="720" height="480"></canvas>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* =======================
+   1) Teachable Machine setup
+   ======================= */
+
+let BASE_URL = "https://teachablemachine.withgoogle.com/models/ddR6QmZQU/"; // default model
+let model, maxPredictions = 0;
+let webcamTM, webcamCtx;
+const statusEl = document.getElementById("status");
+const labelEl  = document.getElementById("label");
+const confEl   = document.getElementById("conf");
+const webcamCanvas = document.getElementById("webcam");
+
+async function loadModelAndWebcam() {
+  try {
+    statusEl.textContent = "⏳ Loading model…";
+    model = await tmImage.load(BASE_URL + "model.json", BASE_URL + "metadata.json");
+    maxPredictions = model.getTotalClasses();
+    statusEl.textContent = "✅ Model loaded";
+
+    // TM Webcam (mirror = true)
+    webcamTM = new tmImage.Webcam(224, 224, true);
+    await webcamTM.setup();   // ขอสิทธิ์กล้อง
+    await webcamTM.play();
+    requestAnimationFrame(loopAI);
+
+    webcamCtx = webcamCanvas.getContext("2d");
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = "❌ Load failed: " + err.message;
+  }
+}
+
+// smoothing history
+const hist = [];
+const HIST_N = 5;
+let lastStable = null;
+const LABEL_MAP = { left: "LEFT", right: "RIGHT", up: "UP", top: "UP", down: "DOWN", none: "NONE", stop:"NONE", start:"NONE" };
+
+function stableDirectionFromPreds(preds) {
+  let best = {className:"none", probability:0};
+  for (const p of preds) if (p.probability > best.probability) best = p;
+
+  const label = (best.className || "none").toLowerCase();
+  const mapped = LABEL_MAP[label] || "NONE";
+
+  hist.push(mapped);
+  if (hist.length > HIST_N) hist.shift();
+
+  const cnt = hist.reduce((acc,x)=> (acc[x]=(acc[x]||0)+1, acc), {});
+  let winner = "NONE", cmax = -1;
+  for (const [k,v] of Object.entries(cnt)) if (v>cmax){cmax=v; winner=k;}
+
+  if (best.probability < 0.60) return lastStable || "NONE";
+  lastStable = winner;
+  labelEl.textContent = `Label: ${label}  → ${winner}`;
+  confEl.textContent  = `Conf: ${best.probability.toFixed(2)}  | hist ${hist.length}/${HIST_N}`;
+  return winner;
+}
+
+async function loopAI() {
+  if (webcamTM) {
+    webcamTM.update();
+    webcamCtx.drawImage(webcamTM.canvas, 0, 0, 224, 224);
+
+    if (model) {
+      try {
+        const preds = await model.predict(webcamTM.canvas);
+        const dir = stableDirectionFromPreds(preds);
+        setGestureDirection(dir);
+      } catch (e) {
+        console.error("predict error:", e);
+      }
+    }
+  }
+  requestAnimationFrame(loopAI);
+}
+
+/* =======================
+   Load model from input
+   ======================= */
+document.getElementById("loadBtn").addEventListener("click", async () => {
+  const input = document.getElementById("modelURL").value.trim();
+  if (!input) {
+    alert("⚠️ กรุณาวางลิงก์โมเดลก่อน");
+    return;
+  }
+
+  BASE_URL = input.endsWith("/") ? input : input + "/";
+
+  statusEl.textContent = "⏳ Loading new model…";
+
+  try {
+    // โหลดโมเดลใหม่
+    model = await tmImage.load(BASE_URL + "model.json", BASE_URL + "metadata.json");
+    maxPredictions = model.getTotalClasses();
+
+    // อัปเดตสถานะ
+    statusEl.textContent = "✅ Model loaded from new URL!";
+
+    // **ไม่ต้อง stop/play กล้อง** เพราะ loopAI ใช้ webcamTM ที่มีอยู่แล้ว
+    // webcamTM จะทำงานต่อโดยอัตโนมัติ
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = "❌ Load failed: " + err.message;
+  }
+});
+
+
+/* =======================
+   2) Snake Game (Canvas)
+   ======================= */
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const gameStateEl = document.getElementById("gameState");
+const speedSel = document.getElementById("speedSel");
+
+const W = canvas.width, H = canvas.height;
+const BLOCK = 20;
+
+const SPEEDS = [
+  [7,  10],
+  [9,  12],
+  [11, 14],
+  [13, 16],
+];
+let speedIdx = 2, FPS = SPEEDS[speedIdx][0], STEP = SPEEDS[speedIdx][1];
+
+let started = false, paused = false, rafId=null, lastTick=0;
+let snake = [], dir="RIGHT", pendingDir=null, food=[0,0], score=0;
+
+function resetGame() {
+  score = 0;
+  snake = [[Math.floor(W/2/BLOCK)*BLOCK, Math.floor(H/2/BLOCK)*BLOCK]];
+  dir = "RIGHT";
+  pendingDir = null;
+  spawnFood();
+}
+
+function spawnFood() {
+  while (true) {
+    const fx = Math.floor(Math.random()*(W/BLOCK))*BLOCK;
+    const fy = Math.floor(Math.random()*(H/BLOCK))*BLOCK;
+    if (!snake.some(p => p[0]===fx && p[1]===fy)) { food=[fx,fy]; break; }
+  }
+}
+
+function setGestureDirection(gestureDir) {
+  if (gestureDir && gestureDir !== "NONE") pendingDir = gestureDir;
+}
+
+function tick() {
+  if (pendingDir) {
+    const opposite = {UP:"DOWN", DOWN:"UP", LEFT:"RIGHT", RIGHT:"LEFT"};
+    if (pendingDir !== opposite[dir]) dir = pendingDir;
+    pendingDir = null;
+  }
+
+  let [x,y] = snake[0];
+  if (dir==="UP") y -= STEP;
+  if (dir==="DOWN") y += STEP;
+  if (dir==="LEFT") x -= STEP;
+  if (dir==="RIGHT") x += STEP;
+
+  if (x < 0) x = W - BLOCK;
+  if (x > W - BLOCK) x = 0;
+  if (y < 0) y = H - BLOCK;
+  if (y > H - BLOCK) y = 0;
+
+  const head=[x,y];
+  snake.unshift(head);
+
+  const hit = !(head[0] > food[0]+BLOCK-1 ||
+                head[0]+BLOCK-1 < food[0] ||
+                head[1] > food[1]+BLOCK-1 ||
+                head[1]+BLOCK-1 < food[1]);
+  if (hit) {
+    score++;
+    spawnFood();
+  } else {
+    snake.pop();
+  }
+
+  if (snake.slice(1).some(p => p[0]===head[0] && p[1]===head[1])) {
+    started=false; paused=false;
+    gameStateEl.textContent = "💥 Game Over — Press SPACE to restart";
+  }
+}
+
+function draw() {
+  ctx.fillStyle = "#0f0f10";
+  ctx.fillRect(0,0,W,H);
+
+  ctx.strokeStyle="#26d07c";
+  ctx.lineWidth=1;
+  ctx.strokeRect(1,1,W-2,H-2);
+
+  ctx.fillStyle="#38bdf8";
+  for (const [sx,sy] of snake) ctx.fillRect(sx, sy, BLOCK, BLOCK);
+
+  ctx.fillStyle="#ffffff";
+  ctx.fillRect(food[0], food[1], BLOCK, BLOCK);
+
+  ctx.fillStyle="#e2e8f0";
+  ctx.font="16px ui-monospace,Consolas,monospace";
+  ctx.fillText(`Score: ${score}`, 10, 22);
+  ctx.fillText(`Speed: ${["Very Slow","Slow","Normal","Fast"][speedIdx]}`, W-170, 22);
+}
+
+function loop(ts) {
+  rafId = requestAnimationFrame(loop);
+  if (!started || paused) return;
+
+  const interval = 1000/FPS;
+  if (ts - lastTick >= interval) {
+    lastTick = ts;
+    tick();
+    draw();
+  }
+}
+
+function startGame() {
+  resetGame();
+  started = true; paused = false;
+  gameStateEl.textContent = "🟢 Game Running…";
+}
+
+function togglePause() {
+  if (!started) return;
+  paused = !paused;
+  gameStateEl.textContent = paused ? "⏸ Paused" : "🟢 Game Running…";
+}
+
+speedSel.addEventListener("change", e=>{
+  speedIdx = +e.target.value;
+  [FPS, STEP] = SPEEDS[speedIdx];
+});
+window.addEventListener("keydown", e=>{
+  if (e.code==="Space") {
+    if (!started) startGame();
+    else togglePause();
+  } else if (e.key>="1" && e.key<="4") {
+    speedSel.value = (e.key-1);
+    speedSel.dispatchEvent(new Event("change"));
+  }
+});
+canvas.addEventListener("click", togglePause);
+
+// boot
+resetGame();
+draw();
+requestAnimationFrame(loop);
+loadModelAndWebcam();
+</script>
+</body>
+</html>
